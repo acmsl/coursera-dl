@@ -156,32 +156,35 @@ class CourseraDownloader(object):
                 classNames.append(className)
                 classResources = li.find('div', {'class':'course-lecture-item-resource'})
 
-                hrefs = classResources.findAll('a')
+                if not classResources:
+                    print " Warning: No resources found"
+                else:
+                    hrefs = classResources.findAll('a')
 
-                # for each resource of that lecture (slides, pdf, ...)
-                # (dont set a filename here, that will be inferred from the week
-                # titles)
-                resourceLinks = [ (h['href'],None) for h in hrefs]
+                    # for each resource of that lecture (slides, pdf, ...)
+                    # (dont set a filename here, that will be inferred from the week
+                    # titles)
+                    resourceLinks = [ (h['href'],None) for h in hrefs]
  
-                # check if the video is included in the resources, if not, try
-                # do download it directly
-                hasvid = [x for x,_ in resourceLinks if x.find('.mp4') > 0]
-                if not hasvid:
-                    ll = li.find('a',{'class':'lecture-link'})
-                    lurl = ll['data-modal-iframe']
-                    bb = self.load_page(lurl)
-                    bb = BeautifulSoup(p,self.parser)
-                    vobj = bb.find('source',type="video/mp4")
+                    # check if the video is included in the resources, if not, try
+                    # do download it directly
+                    hasvid = [x for x,_ in resourceLinks if x.find('.mp4') > 0]
+                    if not hasvid:
+                        ll = li.find('a',{'class':'lecture-link'})
+                        lurl = ll['data-modal-iframe']
+                        p = self.browser.open(lurl)
+                        bb = BeautifulSoup(p,self.parser)
+                        vobj = bb.find('source',type="video/mp4")
 
-                    if not vobj:
-                        print " Warning: Failed to find video for %s" %  className
-                    else:
-                        vurl = vobj['src']
-                        # build the matching filename
-                        fn = className + ".mp4"
-                        resourceLinks.append( (vurl,fn) )
+                        if not vobj:
+                            print " Warning: Failed to find video for %s" %  className
+                        else:
+                            vurl = vobj['src']
+                            # build the matching filename
+                            fn = className + ".mp4"
+                            resourceLinks.append( (vurl,fn) )
 
-                weekClasses[className] = resourceLinks
+                    weekClasses[className] = resourceLinks
 
             # keep track of the list of classNames in the order they appear in the html
             weekClasses['classNames'] = classNames
