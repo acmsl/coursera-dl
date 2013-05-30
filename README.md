@@ -9,7 +9,7 @@ cleaned up and enhanced.
 Installation
 ------------
 
-Make sure you have installed [Python][] 2.7, [pip][], **and** [PyQt4][].
+Make sure you have installed [Python][] 2.7 and [pip][].
 
 Then simply run: pip install coursera-dl
 
@@ -25,13 +25,25 @@ See: coursera-dl -h
 
 Example usage:
 
-coursera-dl -u myusername -p mypassword -d /my/coursera/courses/
-algo-2012-001 ml-2012-002
+<pre>
+coursera-dl -u myusername -p mypassword -d /my/coursera/courses/ algo-2012-001 ml-2012-002
+</pre>
+
+Note: you can also specify your login and password in .netrc file in your home directory.
+Just add this line to ~/.netrc
+<pre>
+machine coursera-dl login myusername password mypassword
+</pre>
+
+Now you can use coursera-dl like this:
+
+<pre>
+coursera-dl -d /my/coursera/courses/ algo-2012-001 ml-2012-002
+</pre>
 
 Note: ensure you have accepted the honor code of the class before using
 this script (happens the very first time you go to the class page).
 
   [https://github.com/abhirama/coursera-download]: https://github.com/abhirama/coursera-download
-  [PyQt4]: http://www.riverbankcomputing.co.uk/software/pyqt/download
   [Python]: http://www.python.org/download/
   [pip]: http://www.pip-installer.org/en/latest/installing.html

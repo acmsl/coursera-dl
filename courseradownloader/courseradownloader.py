@@ -1,25 +1,20 @@
 import re
 import urllib
+import urllib2
 from urlparse import urlsplit
 import argparse
 import os
 import errno
 import unicodedata
 import getpass
+import netrc
 import mechanize
 import cookielib
 from bs4 import BeautifulSoup
-from os import path
 import tempfile
-import time
-
-
-try:
-    from spynner import Browser
-except:
-    print "PyQt4 and/or spynner is not installed, please see http://www.riverbankcomputing.co.uk/software/pyqt/download"
-    exit(-1)
-
+from os import path
+import platform
+import _version
 
 class CourseraDownloader(object):
     """
@@ -27,71 +22,88 @@ class CourseraDownloader(object):
     use offline.
 
     https://github.com/dgorissen/coursera-dl
-    """
 
-    BASE_URL =    'http://class.coursera.org/%s'
+    :param username: username
+    :param password: password
+    :keyword proxy: http proxy, eg: foo.bar.com:1234
+    :keyword parser: xml parser (defaults to lxml)
+    :keyword ignorefiles: comma separated list of file extensions to skip (e.g., "ppt,srt")
+    """
+    BASE_URL =    'https://class.coursera.org/%s'
     HOME_URL =    BASE_URL + '/class/index'
     LECTURE_URL = BASE_URL + '/lecture/index'
     QUIZ_URL =    BASE_URL + '/quiz/index'
     AUTH_URL =    BASE_URL + "/auth/auth_redirector?type=login&subtype=normal"
-    LOGIN_URL =   "http://www.coursera.org/account/signin"
+    LOGIN_URL =   "https://www.coursera.org/maestro/api/user/login"
 
+    #see http://www.crummy.com/software/BeautifulSoup/bs4/doc/#installing-a-parser
     DEFAULT_PARSER = "lxml"
 
-    def __init__(self,username,password,proxy=None,parser=DEFAULT_PARSER):
-        """
-        Requires your coursera username and password. 
-        You can also specify the parser to use (defaults to lxml)
-        see http://www.crummy.com/software/BeautifulSoup/bs4/doc/#installing-a-parser
-        """
+    # how long to try to open a URL before timing out
+    TIMEOUT=60.0
+
+    def __init__(self,username,password,proxy=None,parser=DEFAULT_PARSER,ignorefiles=None):
         self.username = username
         self.password = password
         self.parser = parser
 
+        # Split "ignorefiles" argument on commas, strip, remove prefixing dot
+        # if there is one, and filter out empty tokens.
+        self.ignorefiles =  [x.strip()[1:] if x[0]=='.' else x.strip()
+                             for x in ignorefiles.split(',') if len(x)]
+
         self.browser = None
         self.proxy = proxy
-        self.cookiejar = None
 
-    def login(self):
-        print "* Authenticating as %s..." % self.username
+    def login(self,className):
+        """
+        Automatically generate a cookie file for the coursera site.
+        """
+        #TODO: use proxy here
+        hn,fn = tempfile.mkstemp()
+        cookies = cookielib.LWPCookieJar()
+        handlers = [
+            urllib2.HTTPHandler(),
+            urllib2.HTTPSHandler(),
+            urllib2.HTTPCookieProcessor(cookies)
+        ]
+        opener = urllib2.build_opener(*handlers)
 
-        # a webkit browser, ensure all the javascript can be handled
-        webkit = Browser(embed_jquery=True,want_compat=True,debug_level=0)
-        # enable to see the browser widget
-        #webkit.create_webview()
-        #webkit.webview.show()
+        url = self.lecture_url_from_name(className)
+        req = urllib2.Request(url)
 
-        # wait until the page is loaded, this is determined by the passed
-        # beautifulsoup filter
-        def wait_for_content(waitfor):
-            def can_continue(br):
-                soup = BeautifulSoup(br.html,self.parser)
-                res = waitfor(soup)
-                return bool(res)
+        try:
+            res = opener.open(req)
+        except urllib2.HTTPError as e:
+            if e.code == 404:
+                raise Exception("Unknown class %s" % className)
 
-            webkit.wait_for_content(can_continue, 5, "Timout reached, please check your network and username/password", delay=2)
-            soup = BeautifulSoup(webkit.html,self.parser)
-            return soup
+        # get the csrf token
+        csrfcookie = [c for c in cookies if c.name == "csrf_token"]
+        if not csrfcookie: raise Exception("Failed to find csrf cookie")
+        csrftoken = csrfcookie[0].value
 
-        # open the login page
-        webkit.load(self.LOGIN_URL)
-        page = wait_for_content(lambda s: s.find(id="signin-password"))
+        opener.close()
 
-        # fill in the credentials and submit
-        webkit.fill('input[id="signin-email"]',self.username)
-        webkit.fill('input[id="signin-password"]',self.password)
-        webkit.click('button[type="submit"]')
-
-        # ensure the page is processed
-        res = wait_for_content(lambda s: s.findAll(class_="coursera-profile-listing-sections"))
-
-        # write the cookies to a temporary file and load them
-        hd,fn = tempfile.mkstemp()
-        f = os.fdopen(hd,"w")
-        f.write(webkit.get_cookies())
-        f.close()
+        # call the authenticator url:
         cj = cookielib.MozillaCookieJar(fn)
-        cj.load()
+        opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(cj),
+                                    urllib2.HTTPHandler(),
+                                    urllib2.HTTPSHandler())
+
+        opener.addheaders.append(('Cookie', 'csrftoken=%s' % csrftoken))
+        opener.addheaders.append(('Referer', 'https://www.coursera.org'))
+        opener.addheaders.append(('X-CSRFToken', csrftoken))
+        req = urllib2.Request(self.LOGIN_URL)
+
+        data = urllib.urlencode({'email_address': self.username,'password': self.password})
+        req.add_data(data)
+
+        try:
+            opener.open(req)
+        except urllib2.HTTPError as e:
+            if e.code == 401:
+                raise Exception("Invalid username or password")
 
         # check if we managed to login
         sessionid = [c.name for c in cj if c.name == "sessionid"]
@@ -112,6 +124,10 @@ class CourseraDownloader(object):
 
         self.browser = br
 
+        # also use this cookiejar for other mechanize operations (e.g., urlopen)
+        opener = mechanize.build_opener(mechanize.HTTPCookieProcessor(cj))
+        mechanize.install_opener(opener)
+
     def course_name_from_url(self,course_url):
         """Given the course URL, return the name, e.g., algo2012-p2"""
         return course_url.split('/')[3]
@@ -129,7 +145,7 @@ class CourseraDownloader(object):
         print "* Collecting downloadable content from " + course_url
 
         # get the course name, and redirect to the course lecture page
-        vidpage = self.browser.open(course_url)
+        vidpage = self.browser.open(course_url,timeout=self.TIMEOUT)
 
         # extract the weekly classes
         soup = BeautifulSoup(vidpage,self.parser)
@@ -143,7 +159,7 @@ class CourseraDownloader(object):
         # for each weekly class
         for week in weeks:
             h3 = week.findNext('h3')
-            sanitisedHeaderName = sanitiseFileName(h3.text)
+            sanitisedHeaderName = sanitise_filename(h3.text)
             weeklyTopics.append(sanitisedHeaderName)
             ul = week.next_sibling
             lis = ul.findAll('li')
@@ -152,7 +168,18 @@ class CourseraDownloader(object):
             # for each lecture in a weekly class
             classNames = []
             for li in lis:
-                className = sanitiseFileName(li.a.text)
+                # the name of this lecture/class
+                className = li.a.text.strip()
+
+                # Many class names have the following format: 
+                #   "Something really cool (12:34)"
+                # If the class name has this format, replace the colon in the
+                # time with a hyphen.
+                if re.match(".+\(\d?\d:\d\d\)$",className):
+                    head,sep,tail = className.rpartition(":")
+                    className = head  + "-" + tail
+
+                className = sanitise_filename(className)
                 classNames.append(className)
                 classResources = li.find('div', {'class':'course-lecture-item-resource'})
 
@@ -161,19 +188,36 @@ class CourseraDownloader(object):
                 else:
                     hrefs = classResources.findAll('a')
 
-                    # for each resource of that lecture (slides, pdf, ...)
-                    # (dont set a filename here, that will be inferred from the week
-                    # titles)
-                    resourceLinks = [ (h['href'],None) for h in hrefs]
+                # collect the resources for a particular lecture (slides, pdf,
+                # links,...)
+                resourceLinks = []
+
+                for a in hrefs:
+                    # get the hyperlink itself
+                    h = a.get('href')
+                    if not h: continue
+
+                    # Sometimes the raw, uncompresed source videos are available as
+                    # well. Don't download them as they are huge and available in
+                    # compressed form anyway.
+                    if h.find('source_videos') > 0:
+                        print "   - will skip raw source video " + h
+                    else:
+                        # Dont set a filename here, that will be inferred from the week
+                        # titles
+                        resourceLinks.append( (h,None) )
  
-                    # check if the video is included in the resources, if not, try
-                    # do download it directly
-                    hasvid = [x for x,_ in resourceLinks if x.find('.mp4') > 0]
-                    if not hasvid:
-                        ll = li.find('a',{'class':'lecture-link'})
-                        lurl = ll['data-modal-iframe']
-                        p = self.browser.open(lurl)
-                        bb = BeautifulSoup(p,self.parser)
+                # check if the video is included in the resources, if not, try
+                # do download it directly
+                hasvid = [x for x,_ in resourceLinks if x.find('.mp4') > 0]
+                if not hasvid:
+                    ll = li.find('a',{'class':'lecture-link'})
+                    lurl = ll['data-modal-iframe']
+
+                    try:
+                        pg = self.browser.open(lurl,timeout=self.TIMEOUT)
+
+                        bb = BeautifulSoup(pg,self.parser)
                         vobj = bb.find('source',type="video/mp4")
 
                         if not vobj:
@@ -184,7 +228,12 @@ class CourseraDownloader(object):
                             fn = className + ".mp4"
                             resourceLinks.append( (vurl,fn) )
 
-                    weekClasses[className] = resourceLinks
+                    except urllib2.HTTPError as e:
+                        # sometimes there is a lecture without a vidio (e.g.,
+                        # genes-001) so this can happen.
+                        print " Warning: failed to download video directly url %s: %s" % (lurl,e)
+
+                weekClasses[className] = resourceLinks
 
             # keep track of the list of classNames in the order they appear in the html
             weekClasses['classNames'] = classNames
@@ -193,26 +242,41 @@ class CourseraDownloader(object):
 
         return (weeklyTopics, allClasses)
 
+    def get_headers(self,url):
+        """
+        Get the headers
+        """
+        r = self.browser.open(url,timeout=self.TIMEOUT)
+        return r.info()
+
     def download(self, url, target_dir=".", target_fname=None):
         """
         Download the url to the given filename
         """
 
         # get the headers
-        r = self.browser.open(url)
-        headers = r.info()
+        headers = self.get_headers(url)
 
         # get the content length (if present)
-        clen = int(headers['Content-Length']) if 'Content-Length' in headers else -1 
+        clen = int(headers.get('Content-Length',-1))
 
         # build the absolute path we are going to write to
-        fname = target_fname or sanitiseFileName(CourseraDownloader.getFileName(headers)) or CourseraDownloader.getFileNameFromURL(url)
-        filepath = os.path.join(target_dir,fname)
+        fname = target_fname or filename_from_header(headers) or filename_from_url(url)
+
+        # split off the extension
+        _,ext = path.splitext(fname)
+
+        # check if we should skip it (remember to remove the leading .)
+        if ext and ext[1:] in self.ignorefiles:
+            print '    - skipping "%s" (extension ignored)' % fname 
+            return
+
+        filepath = path.join(target_dir,fname)
 
         dl = True
-        if os.path.exists(filepath):
+        if path.exists(filepath):
             if clen > 0: 
-                fs = os.path.getsize(filepath)
+                fs = path.getsize(filepath)
                 delta = clen - fs
 
                 # all we know is that the current filesize may be shorter than it should be and the content length may be incorrect
@@ -232,33 +296,42 @@ class CourseraDownloader(object):
 
         try:
            if dl:
-                self.browser.retrieve(url,filepath)
+                self.browser.retrieve(url,filepath,timeout=self.TIMEOUT)
         except Exception as e:
             print "Failed to download url %s to %s: %s" % (url,filepath,e)
 
-    def download_course(self,cname,dest_dir="."):
+    def download_course(self,cname,dest_dir=".",reverse_sections=False):
         """
         Download all the contents (quizzes, videos, lecture notes, ...) of the course to the given destination directory (defaults to .)
         """
         # open the main class page
-        self.browser.open(self.AUTH_URL % cname)
+        self.browser.open(self.AUTH_URL % cname,timeout=self.TIMEOUT)
 
         # get the lecture url
         course_url = self.lecture_url_from_name(cname)
 
         (weeklyTopics, allClasses) = self.get_downloadable_content(course_url)
-        print '* Got all downloadable content for ' + cname
 
-        course_dir = os.path.abspath(os.path.join(dest_dir,cname))
+        if not weeklyTopics:
+            print " Warning: no downloadable content found for %s, did you accept the honour code?" % cname
+            return
+        else:
+            print '* Got all downloadable content for ' + cname
+
+        if reverse_sections:
+            weeklyTopics.reverse()
+            print "* Sections reversed"
+
+        course_dir = path.abspath(path.join(dest_dir,cname))
 
         # ensure the target dir exists
-        if not os.path.exists(course_dir):
+        if not path.exists(course_dir):
             os.mkdir(course_dir)
 
         print "* " + cname + " will be downloaded to " + course_dir
 
         # ensure the course directory exists
-        if not os.path.exists(course_dir):
+        if not path.exists(course_dir):
             os.makedirs(course_dir)
 
         # download the standard pages
@@ -269,14 +342,15 @@ class CourseraDownloader(object):
         # now download the actual content (video's, lecture notes, ...)
         for j,weeklyTopic in enumerate(weeklyTopics,start=1):
             if weeklyTopic not in allClasses:
-                #print 'Weekly topic not in all classes:', weeklyTopic
+                #TODO: refactor
+                print 'Warning: Weekly topic not in all classes:', weeklyTopic
                 continue
 
             # ensure the week dir exists
             # add a numeric prefix to the week directory name to ensure chronological ordering
             wkdirname = str(j).zfill(2) + " - " + weeklyTopic
-            wkdir = os.path.join(course_dir,wkdirname)
-            if not os.path.exists(wkdir):
+            wkdir = path.join(course_dir,wkdirname)
+            if not path.exists(wkdir):
                 os.makedirs(wkdir)
 
             weekClasses = allClasses[weeklyTopic]
@@ -286,14 +360,16 @@ class CourseraDownloader(object):
 
             for i,className in enumerate(classNames,start=1):
                 if className not in weekClasses:
+                    #TODO: refactor
+                    print "Warning:",className,"not in",weekClasses.keys()
                     continue
 
                 classResources = weekClasses[className]
 
                 # ensure the class dir exists
                 clsdirname = str(i).zfill(2) + " - " + className
-                clsdir = os.path.join(wkdir,clsdirname)
-                if not os.path.exists(clsdir): 
+                clsdir = path.join(wkdir,clsdirname)
+                if not path.exists(clsdir): 
                     os.makedirs(clsdir)
 
                 print "  - Downloading resources for " + className
@@ -315,53 +391,44 @@ class CourseraDownloader(object):
                        print "    - failed: ",classResource,e
 
 
-    @staticmethod
-    def extractFileName(contentDispositionString):
-        #print contentDispositionString
+def filename_from_header(header):
+    try:
+        cd = header['Content-Disposition']
         pattern = 'attachment; filename="(.*?)"'
-        m = re.search(pattern, contentDispositionString)
-        try:
-            return m.group(1)
-        except Exception:
-            return ''
+        m = re.search(pattern, cd)
+        g = m.group(1)
+        return sanitise_filename(g)
+    except Exception:
+        return ''
 
-    @staticmethod
-    def getFileName(header):
-        try:
-            return CourseraDownloader.extractFileName(header['Content-Disposition']).lstrip()
-        except Exception:
-            return ''
+def filename_from_url(url):
+    # parse the url into its components
+    u = urlsplit(url)
 
+    # split the path into parts and unquote
+    parts = [urllib2.unquote(x).strip() for x in u.path.split('/')]
 
-    @staticmethod
-    def getFileNameFromURL(url):
-        # parse the url into its components
-        u = urlsplit(url)
+    # take the last component as filename
+    fname = parts[-1]
 
-        # split the path into parts and unquote
-        parts = [urllib.unquote(x).strip() for x in u.path.split('/')]
+    # if empty, url ended with a trailing slash
+    # so join up the hostnam/path  and use that as a filename
+    if len(fname) < 1:
+        s = u.netloc + u.path[:-1]
+        fname = s.replace('/','_')
+    else:
+        # unquoting could have cuased slashes to appear again
+        # split and take the last element if so
+        fname = fname.split('/')[-1]
 
-        # take the last component as filename
-        fname = parts[-1]
+    # add an extension if none
+    ext = path.splitext(fname)[1]
+    if len(ext) < 1 or len(ext) > 5: fname += ".html"
 
-        # if empty, url ended with a trailing slash
-        # so join up the hostnam/path  and use that as a filename
-        if len(fname) < 1:
-           s = u.netloc + u.path[:-1]
-           fname = s.replace('/','_')
-        else:
-            # unquoting could have cuased slashes to appear again
-            # split and take the last element if so
-            fname = fname.split('/')[-1]
+    # remove any illegal chars and return
+    return sanitise_filename(fname)
 
-        # add an extension if none
-        ext = os.path.splitext(fname)[1]
-        if len(ext) < 1 or len(ext) > 5: fname += ".html"
-
-        # remove any illegal chars and return
-        return sanitiseFileName(fname)
-
-def sanitiseFileName(fileName):
+def sanitise_filename(fileName):
     # ensure a clean, valid filename (arg may be both str and unicode)
 
     # ensure a unicode string, problematic ascii chars will get removed
@@ -383,14 +450,16 @@ def sanitiseFileName(fileName):
     max = 250
 
     # split off extension, trim, and re-add the extension
-    fn,ext = os.path.splitext(s)
+    fn,ext = path.splitext(s)
     s = fn[:max-len(ext)] + ext
 
     return s
 
+# TODO: simplistic
 def isValidURL(url):
     return url.startswith('http') or url.startswith('https')
 
+# TODO: is this really still needed
 class AbsoluteURLGen(object):
     """
     Generate absolute URLs from relative ones
@@ -442,6 +511,43 @@ class AbsoluteURLGen(object):
                     url = url[2:]
                 return self.base + url
 
+def get_netrc_creds():
+    """
+    Read username/password from the users' netrc file. Returns None if no
+    coursera credentials can be found.
+    """
+    # inspired by https://github.com/jplehmann/coursera
+
+    if platform.system() == 'Windows':
+        # where could the netrc file be hiding, try a number of places 
+        env_vars = ["HOME","HOMEDRIVE", "HOMEPATH","USERPROFILE","SYSTEMDRIVE"]
+        env_dirs = [os.environ[e] for e in env_vars if os.environ.get(e,None)]
+
+        # also try the root/cur dirs
+        env_dirs += ["C:", ""]
+
+        # possible filenames
+        file_names = [".netrc", "_netrc"]
+
+        # all possible paths
+        paths = [path.join(dir,fn) for dir in env_dirs for fn in file_names]
+    else:
+        # on *nix just put None, and the correct default will be used
+        paths = [None]
+
+    # try the paths one by one and return the first one that works
+    creds = None
+    for p in paths:
+        try:
+            auths = netrc.netrc(p).authenticators('coursera-dl')
+            creds = (auths[0], auths[2])
+            print "Credentials found in .netrc file"
+            break
+        except (IOError, TypeError, netrc.NetrcParseError) as e:
+            pass
+
+    return creds
+
 # is lxml available?
 def haslxml():
     try:
@@ -453,39 +559,55 @@ def haslxml():
 def main():
     # parse the commandline arguments
     parser = argparse.ArgumentParser(description='Download Coursera.org course videos/docs for offline use.')
-    parser.add_argument("-u", dest='username', type=str, required=True, help='coursera.org username')
-    parser.add_argument("-p", dest='password', type=str, help='coursera.org password')
+    parser.add_argument("-u", dest='username', type=str, help='coursera username (.netrc used if omitted)')
+    parser.add_argument("-p", dest='password', type=str, help='coursera password')
     parser.add_argument("-d", dest='dest_dir', type=str, default=".", help='destination directory where everything will be saved')
+    parser.add_argument("-n", dest='ignorefiles', type=str, default="", help='comma-separated list of file extensions to skip, e.g., "ppt,srt,pdf"')
     parser.add_argument("-q", dest='parser', type=str, default=CourseraDownloader.DEFAULT_PARSER,
                         help="the html parser to use, see http://www.crummy.com/software/BeautifulSoup/bs4/doc/#installing-a-parser")
     parser.add_argument("-x", dest='proxy', type=str, default=None, help="proxy to use, e.g., foo.bar.com:3125")
+    parser.add_argument("--reverse-sections", dest='reverse', action="store_true",
+                        default=False, help="download and save the sections in reverse order")
     parser.add_argument('course_names', nargs="+", metavar='<course name>',
-                        type=str, help='one or more course names (from the url)')
+                        type=str, help='one or more course names from the url (e.g., comnets-2012-001)')
     args = parser.parse_args()
 
     # check the parser
-    parser = args.parser
-    if parser == 'lxml' and not haslxml():
-        print "Warning: lxml not available, falling back to built-in 'html.parser' (see -q option), this may cause problems on Python < 2.7.3"
-        parser = 'html.parser'
+    html_parser = args.parser
+    if html_parser == 'lxml' and not haslxml():
+        print " Warning: lxml not available, falling back to built-in 'html.parser' (see -q option), this may cause problems on Python < 2.7.3"
+        html_parser = 'html.parser'
     else:
         pass
 
-    print "HTML parser set to %s" % parser
+    print "Coursera-dl v%s (%s)" % (_version.__version__,html_parser)
 
-    # prompt the user for his password if not specified
-    if not args.password:
-        args.password = getpass.getpass()
+    # search for login credentials in .netrc file if username hasn't been provided in command-line args
+    username, password = args.username, args.password
+    if not username:
+        creds = get_netrc_creds()
+        if not creds:
+            raise Exception("No username passed and no .netrc credentials found, unable to login")
+        else:
+            username, password = creds
+    else:
+        # prompt the user for his password if not specified
+        if not password:
+            password = getpass.getpass()
 
     # instantiate the downloader class
-    d = CourseraDownloader(args.username,args.password,proxy=args.proxy,parser=parser)
+    d = CourseraDownloader(username,password,proxy=args.proxy,parser=html_parser,ignorefiles=args.ignorefiles)
     
-    # authenticate
-    d.login()
+    # authenticate, only need to do this once but need a classaname to get hold
+    # of the csrf token, so simply pass the first one
+    print "Logging in as '%s'..." % username
+    d.login(args.course_names[0])
 
     # download the content
-    for cn in args.course_names:
-        d.download_course(cn,dest_dir=args.dest_dir)
+    for i,cn in enumerate(args.course_names,start=1):
+        print
+        print "Course %s of %s" % (i,len(args.course_names))
+        d.download_course(cn,dest_dir=args.dest_dir,reverse_sections=args.reverse)
 
 if __name__ == '__main__':
     main()
